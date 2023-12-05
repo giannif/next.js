@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use napi::bindgen_prelude::*;
+use napi::{bindgen_prelude::*, JsObject};
+use next_page_static_info::collect_exports;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use turbopack_binding::swc::core::{
     base::{config::ParseOptions, try_with_handler},
     common::{
@@ -89,4 +92,107 @@ pub fn parse(
         },
         signal,
     )
+}
+
+/// wrap read file to suppress errors conditionally.
+fn read_file_wrapped_err(path: &str, raise_err: bool) -> Result<String> {
+    let ret = std::fs::read_to_string(path).map_err(|e| {
+        napi::Error::new(
+            Status::GenericFailure,
+            format!("Next.js ERROR: Failed to read file {}:\n{:#?}", path, e),
+        )
+    });
+
+    match ret {
+        Ok(_) | Err(_) if raise_err => ret,
+        _ => Ok("".to_string()),
+    }
+}
+
+/// A regex pattern to determine if is_dynamic_metadata_route should continue to
+/// parse the page or short circuit and return false.
+static DYNAMIC_METADATA_ROUTE_SHORT_CURCUIT: Lazy<Regex> =
+    Lazy::new(|| Regex::new("generateImageMetadata|generateSitemaps").unwrap());
+
+pub struct DetectMetadataRouteTask {
+    page_file_path: String,
+}
+
+#[napi]
+impl Task for DetectMetadataRouteTask {
+    type Output = bool;
+    type JsValue = bool;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let file_content = read_file_wrapped_err(self.page_file_path.as_str(), true)?;
+
+        if !DYNAMIC_METADATA_ROUTE_SHORT_CURCUIT.is_match(file_content.as_str()) {
+            if self.page_file_path.ends_with("apple-icon.tsx") {
+                println!("short circuit {}", file_content);
+            }
+            return Ok(false);
+        }
+
+        let x = collect_exports(&file_content, &self.page_file_path).expect("should parse");
+        if self.page_file_path.ends_with("apple-icon.tsx") {
+            println!("{:#?}", x);
+        }
+
+        collect_exports(&file_content, &self.page_file_path)
+            .convert_err()
+            .map(|exports_info| {
+                if self.page_file_path.ends_with("apple-icon.tsx") {
+                    println!("{:#?}", exports_info);
+                }
+                !exports_info.generate_image_metadata.unwrap_or_default()
+                    || !exports_info.generate_sitemaps.unwrap_or_default()
+            })
+    }
+
+    fn resolve(
+        &mut self,
+        _env: Env,
+        is_dynamic_metadata_route: Self::Output,
+    ) -> napi::Result<Self::JsValue> {
+        Ok(is_dynamic_metadata_route)
+    }
+}
+
+/// Detect if metadata routes is a dynamic route, which containing
+/// generateImageMetadata or generateSitemaps as export
+#[napi]
+pub fn is_dynamic_metadata_route(page_file_path: String) -> AsyncTask<DetectMetadataRouteTask> {
+    AsyncTask::new(DetectMetadataRouteTask { page_file_path })
+}
+
+#[napi(object, object_to_js = false)]
+pub struct CollectPageStaticInfoOption {
+    pub page_file_path: String,
+    pub next_config: JsObject, // NextConfig
+    pub is_dev: Option<bool>,
+    pub page: Option<String>,
+    pub page_type: String, //'pages' | 'app' | 'root'
+}
+
+pub struct CollectPageStaticInfoTask {}
+
+#[napi]
+impl Task for CollectPageStaticInfoTask {
+    type Output = bool;
+    type JsValue = bool;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        Ok(false)
+    }
+
+    fn resolve(&mut self, _env: Env, result: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(result)
+    }
+}
+
+#[napi]
+pub fn get_page_static_info(
+    _option: CollectPageStaticInfoOption,
+) -> AsyncTask<CollectPageStaticInfoTask> {
+    AsyncTask::new(CollectPageStaticInfoTask {})
 }
